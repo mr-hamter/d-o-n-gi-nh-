@@ -1,0 +1,172 @@
+import json
+import requests
+import pandas as pd
+import os
+import time
+from tqdm import tqdm
+
+# ==========================================
+# 1. CẤU HÌNH API & TOP 20 THÀNH PHỐ TỐI ƯU
+# ==========================================
+API_ENDPOINT = 'https://realtime.oxylabs.io/v1/queries'
+API_AUTH = ('leducanhtuan06_zq1gT', 'Tuanlddanh06+')
+
+# Danh sách 20 thành phố lớn (Mục tiêu: ~16,000 listings)
+target_cities = [
+    "new-york-ny", "los-angeles-ca", "chicago-il", "houston-tx", "phoenix-az",
+    "philadelphia-pa", "san-antonio-tx", "san-diego-ca", "dallas-tx", "san-jose-ca",
+    "austin-tx", "jacksonville-fl", "san-francisco-ca", "seattle-wa", "denver-co",
+    "washington-dc", "boston-ma", "miami-fl", "atlanta-ga", "las-vegas-nv"
+]
+
+MAX_PAGES_PER_CITY = 20 
+
+# Thiết lập thư mục lưu trữ
+output_dir = os.path.expanduser("~/workspace/project_ml/")
+os.makedirs(output_dir, exist_ok=True)
+
+CHECKPOINT_FILE = os.path.join(output_dir, "zillow_16k_auto_save.csv")
+FINAL_FILE = os.path.join(output_dir, "zillow_16k_dataset_full.csv")
+
+# ==========================================
+# PHASE 1: CÀO DIỆN RỘNG (GOM KHOẢNG 16.000 LINK)
+# ==========================================
+print("="*70)
+print(f"PHASE 1: QUÉT {len(target_cities)} THÀNH PHỐ ĐỂ LẤY DATA CƠ BẢN")
+print("="*70)
+
+all_basic_listings = []
+
+for city in target_cities:
+    print(f"\n[*] Đang quét: {city.upper()}")
+    for page in range(1, MAX_PAGES_PER_CITY + 1):
+        page_slug = f"{page}_p/" if page > 1 else ""
+        target_url = f"https://www.zillow.com/{city}/{page_slug}"
+        
+        payload = {
+            "source": "universal",
+            "url": target_url,
+            "user_agent_type": "desktop",
+            "render": "html",
+            "browser_instructions": [{"type": "fetch_resource", "filter": "https://www.zillow.com/async-create-search-page-state"}]
+        }
+        
+        try:
+            response = requests.post(API_ENDPOINT, json=payload, auth=API_AUTH)
+            if response.status_code == 200:
+                data = response.json()
+                zillow_json_str = data["results"][0]["content"]
+                zillow_data = json.loads(zillow_json_str)
+                
+                search_results = zillow_data.get("cat1", {}).get("searchResults", {})
+                raw_listings = search_results.get("listResults", []) or search_results.get("mapResults", [])
+                
+                if raw_listings:
+                    all_basic_listings.extend(raw_listings)
+                    print(f"  -> Trang {page}: Vớt được {len(raw_listings)} nhà. (Tổng: {len(all_basic_listings)})")
+                else:
+                    print(f"  -> Trang {page}: Hết dữ liệu. Chuyển thành phố!")
+                    break 
+        except Exception as e:
+            print(f"  -> [LỖI] Bỏ qua {city} trang {page}.")
+            
+        time.sleep(1.0) 
+
+print(f"\n[HOÀN TẤT PHASE 1] Tổng cộng gom được: {len(all_basic_listings)} căn nhà.")
+
+if not all_basic_listings:
+    print("Không cào được dữ liệu nào. Dừng chương trình.")
+    exit()
+
+df_basic = pd.json_normalize(all_basic_listings)
+url_col = 'detailUrl' if 'detailUrl' in df_basic.columns else [c for c in df_basic.columns if 'detailUrl' in c][0]
+
+# ==========================================
+# PHASE 2: CÀO SÂU EXTRA FEATURES TỪNG CĂN NHÀ
+# ==========================================
+print("\n" + "="*70)
+print(f"PHASE 2: TRUY CẬP {len(df_basic)} LINK ĐỂ BÓC TÁCH NỘI THẤT")
+print("=> CẢNH BÁO: Tốn khoảng 4-5 tiếng. Hệ thống TỰ ĐỘNG LƯU mỗi 500 căn!")
+print("="*70)
+
+fully_merged_data = []
+
+for idx, row in tqdm(df_basic.iterrows(), total=len(df_basic), desc="Tiến trình cào Extra"):
+    house_dict = row.to_dict()
+    url = row[url_col]
+    
+    if isinstance(url, str) and url.startswith("/"):
+        url = "https://www.zillow.com" + url
+        
+    if isinstance(url, str) and url.startswith("http"):
+        payload_detail = {
+            "source": "universal",
+            "url": url,
+            "user_agent_type": "desktop",
+            "render": "html",
+            "browser_instructions": [{"type": "fetch_resource", "filter": "https://www.zillow.com/graphql/"}]
+        }
+        
+        try:
+            res = requests.post(API_ENDPOINT, json=payload_detail, auth=API_AUTH)
+            if res.status_code == 200:
+                html_content = res.json()["results"][0]["content"]
+                
+                if "id=\"__NEXT_DATA__\"" in html_content:
+                    start_str = 'id="__NEXT_DATA__" type="application/json">'
+                    end_idx = html_content.find('</script>', html_content.find(start_str))
+                    json_str = html_content[html_content.find(start_str) + len(start_str):end_idx]
+                    
+                    full_json = json.loads(json_str)
+                    property_details = full_json.get("props", {}).get("pageProps", {}).get("componentProps", {}).get("gdpClientCache", {})
+                    
+                    if property_details:
+                        cache_key = list(property_details.keys())[0]
+                        reso = property_details[cache_key].get("property", {}).get("resoFacts", {})
+                        
+                        house_dict.update({
+                            "reso_heating": reso.get("heating"),
+                            "reso_cooling": reso.get("cooling"),
+                            "reso_appliances": reso.get("appliances"),
+                            "reso_construction_materials": reso.get("constructionMaterials"),
+                            "reso_roof": reso.get("roof"),
+                            "reso_foundation": reso.get("foundation"),
+                            "reso_interior_features": reso.get("interiorFeatures"),
+                            "reso_parking_features": reso.get("parkingFeatures"),
+                            "reso_stories": reso.get("stories"),
+                            "reso_architectural_style": reso.get("architecturalStyle")
+                        })
+        except Exception:
+            pass 
+
+    fully_merged_data.append(house_dict)
+    time.sleep(0.8) # Nghỉ một nhịp nhỏ để bảo vệ kết nối API
+    
+    # ----------------------------------------------------
+    # CHỨC NĂNG AUTO-SAVE: BẢO VỆ DỮ LIỆU MỖI 500 CĂN
+    # ----------------------------------------------------
+    if (idx + 1) % 500 == 0:
+        pd.DataFrame(fully_merged_data).to_csv(CHECKPOINT_FILE, index=False, encoding="utf-8-sig")
+        print(f"  [AUTO-SAVE] Đã sao lưu an toàn {idx + 1} căn...")
+
+# ==========================================
+# 3. LƯU THÀNH QUẢ CUỐI CÙNG
+# ==========================================
+print("\n" + "="*70)
+print("ĐANG XUẤT FILE DATASET CUỐI CÙNG...")
+
+df_final = pd.DataFrame(fully_merged_data)
+
+try:
+    df_final.to_csv(FINAL_FILE, index=False, encoding="utf-8-sig")
+    print(f"\n[THÀNH CÔNG] Dataset ~16,000 dòng (Basic + Extra) đã hoàn tất tại:")
+    print(f"-> {FINAL_FILE}")
+    
+    # Xóa file lưu tạm nếu script chạy mượt đến tận cùng
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        
+except OSError:
+    fallback_path = "/tmp/zillow_16k_dataset_full.csv"
+    df_final.to_csv(fallback_path, index=False, encoding="utf-8-sig")
+    print(f"\n[THÀNH CÔNG] Đã lưu tại: {fallback_path}")
